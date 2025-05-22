@@ -30,70 +30,73 @@ def normalize_verses(verses):
 # ----------- PDF Loading & Verse Extraction -----------
 
 def load_pdf_and_extract_verses(pdf_path, max_pages=10):
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception as e:
-        st.error(f"Failed to open PDF: {e}")
-        return []
-
+    doc = fitz.open(pdf_path)
     all_verses = []
-    try:
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                break
-            text = page.get_text()
-            verses = extract_verses(text)
-            if verses:
-                verses = normalize_verses(verses)
-                all_verses.extend(verses)
-    except Exception as e:
-        st.error(f"Error extracting text from PDF pages: {e}")
-    finally:
-        doc.close()
+    for i, page in enumerate(doc):
+        if i >= max_pages:
+            break
+        text = page.get_text()
+        verses = extract_verses(text)
+        if verses:
+            verses = normalize_verses(verses)
+            all_verses.extend(verses)
+    doc.close()
     return all_verses
 
 # ----------- Embedding & FAISS Index -----------
 
 class QuranRetriever:
-    def __init__(self, verses, model):
+    def __init__(self, verses):
         self.verses = verses
         self.texts = [v[1] for v in verses]
-        self.model = model
+        self.model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
         self.embeddings = self.model.encode(self.texts, show_progress_bar=True, convert_to_numpy=True)
+
+        if self.embeddings.shape[0] == 0:
+            st.error("No embeddings generated! Cannot build index.")
+            self.index = None
+            return
+
         self.index = faiss.IndexFlatIP(self.embeddings.shape[1])  # Inner product similarity
         faiss.normalize_L2(self.embeddings)  # Normalize embeddings for cosine similarity
         self.index.add(self.embeddings)
 
     def search(self, query, top_k=5):
+        if self.index is None or self.index.ntotal == 0:
+            return []
+
         query_emb = self.model.encode([query], convert_to_numpy=True)
         faiss.normalize_L2(query_emb)
-        D, I = self.index.search(query_emb, top_k)
+        k = min(top_k, self.index.ntotal)
+        if k == 0:
+            return []
+        D, I = self.index.search(query_emb, k)
         results = []
         for idx in I[0]:
             results.append(self.verses[idx])
         return results
 
-# ----------- Model loading (cached) -----------
+# ----------- Generation (using summarization pipeline for demo) -----------
 
-@st.cache_resource
-def load_models():
-    model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-    generator = pipeline("summarization", model="facebook/bart-large-cnn")
-    return model, generator
-
-model, generator = load_models()
-
-# ----------- Generation -----------
+generator = pipeline("summarization", model="facebook/bart-large-cnn")
 
 def generate_answer(retrieved_verses, question):
     """
     Generate an answer by concatenating retrieved verses and summarizing with question.
-    This is a simplified demo using summarization.
+    Truncate input to model max length to avoid errors.
     """
     context = " ".join([v[1] for v in retrieved_verses])
     input_text = f"Question: {question}\nContext: {context}"
-    output = generator(input_text, max_length=100, min_length=20, do_sample=False)
-    return output[0]['summary_text']
+
+    max_input_chars = 2000  # Adjust as needed
+    if len(input_text) > max_input_chars:
+        input_text = input_text[:max_input_chars]
+
+    try:
+        output = generator(input_text, max_length=100, min_length=20, do_sample=False)
+        return output[0]['summary_text']
+    except Exception as e:
+        return f"Error generating answer: {e}"
 
 # ----------- Evaluation -----------
 
@@ -118,34 +121,38 @@ def main():
     if uploaded_file:
         with open("temp_quran.pdf", "wb") as f:
             f.write(uploaded_file.getbuffer())
-            f.flush()
         st.success("PDF uploaded successfully!")
 
         if st.button("Process PDF and build index"):
             with st.spinner("Extracting verses and building index..."):
                 verses = load_pdf_and_extract_verses("temp_quran.pdf", max_pages=20)
-                if not verses:
-                    st.error("No verses extracted. Please check the PDF content or extraction logic.")
-                else:
-                    st.write(f"Extracted {len(verses)} verses.")
-                    st.session_state['retriever'] = QuranRetriever(verses, model)
+                st.write(f"Extracted {len(verses)} verses.")
+                global retriever
+                retriever = QuranRetriever(verses)
+                if retriever.index is not None:
                     st.success("Index built successfully!")
+                else:
+                    st.error("Failed to build index.")
 
-    if 'retriever' in st.session_state:
-        retriever = st.session_state['retriever']
+    if 'retriever' in globals() and retriever.index is not None and retriever.index.ntotal > 0:
         question = st.text_input("Enter your question about Quran verses:")
         if question:
             with st.spinner("Searching and generating answer..."):
                 results = retriever.search(question, top_k=5)
-                answer = generate_answer(results, question)
-                eval_metrics = evaluate_answer(answer, results)
-                st.subheader("Answer:")
-                st.write(answer)
-                st.subheader("Retrieved Verses:")
-                for num, verse in results:
-                    st.write(f"{num}: {verse}")
-                st.subheader("Evaluation Metrics:")
-                st.write(eval_metrics)
+                if not results:
+                    st.warning("No results found.")
+                else:
+                    answer = generate_answer(results, question)
+                    eval_metrics = evaluate_answer(answer, results)
+                    st.subheader("Answer:")
+                    st.write(answer)
+                    st.subheader("Retrieved Verses:")
+                    for num, verse in results:
+                        st.write(f"{num}: {verse}")
+                    st.subheader("Evaluation Metrics:")
+                    st.write(eval_metrics)
+    elif 'retriever' in globals():
+        st.warning("Index is empty, please upload and process a valid PDF first.")
 
 if __name__ == "__main__":
     main()
